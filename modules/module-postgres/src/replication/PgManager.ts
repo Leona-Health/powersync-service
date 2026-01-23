@@ -10,8 +10,10 @@ export interface PgManagerOptions extends pgwire.PgPoolOptions {}
 
 /**
  * Shorter timeout for snapshot connections than for replication connections.
+ *
+ * Leona patch: revert to 6 min timeout until we figure out a better long term solution.
  */
-const SNAPSHOT_SOCKET_TIMEOUT = 30_000;
+const SNAPSHOT_SOCKET_TIMEOUT = 360_000;
 
 export interface PgManagerListener {
   onEnded(): void;

@@ -202,10 +202,10 @@ export class WalStream {
       SELECT
         c.oid AS relid,
         c.relname AS table_name,
-        (SELECT 
+        (SELECT
           json_agg(DISTINCT a.atttypid)
           FROM pg_attribute a
-          WHERE a.attnum > 0 AND NOT a.attisdropped AND a.attrelid = c.oid) 
+          WHERE a.attnum > 0 AND NOT a.attisdropped AND a.attrelid = c.oid)
         AS column_types
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -375,13 +375,18 @@ WHERE  oid = $1::regclass`,
    * and starts again from scratch.
    */
   async startInitialReplication(replicationConnection: pgwire.PgConnection, status: InitResult) {
+    this.logger.info(`startInitialReplication begin`);
+
     // If anything here errors, the entire replication process is aborted,
     // and all connections are closed, including this one.
     const db = await this.connections.snapshotConnection();
 
     const slotName = this.slot_name;
+    this.logger.info(`snapshot connection created for slot ${slotName}`);
 
     if (status.needsNewSlot) {
+      this.logger.info(`before calling storage.cleear for slot ${slotName}`);
+
       // This happens when there is no existing replication slot, or if the
       // existing one is unhealthy.
       // In those cases, we have to start replication from scratch.
@@ -389,10 +394,14 @@ WHERE  oid = $1::regclass`,
       // initial replication where we left off.
       await this.storage.clear({ signal: this.abort_signal });
 
+      this.logger.info(`before dropping replication slot for slot ${slotName}`);
+
       await db.query({
         statement: 'SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1',
         params: [{ type: 'varchar', value: slotName }]
       });
+
+      this.logger.info(`before creating replication slot for slot ${slotName}`);
 
       // We use the replication connection here, not a pool.
       // The replication slot must be created before we start snapshotting tables.
