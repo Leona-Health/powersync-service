@@ -73,16 +73,17 @@ export class PostgresCompactor {
    * See /docs/compacting-operations.md for details.
    */
   async compact() {
-    if (this.buckets) {
-      for (let bucket of this.buckets) {
-        // We can make this more efficient later on by iterating
-        // through the buckets in a single query.
-        // That makes batching more tricky, so we leave for later.
-        await this.compactInternal(bucket);
-      }
-    } else {
-      await this.compactInternal(undefined);
-    }
+    // GJN: hack to simplify and remove the bucket-specific logic
+    // if (this.buckets) {
+    //   for (let bucket of this.buckets) {
+    //     // We can make this more efficient later on by iterating
+    //     // through the buckets in a single query.
+    //     // That makes batching more tricky, so we leave for later.
+    //     await this.compactInternal(bucket);
+    //   }
+    // } else {
+    await this.compactInternal(undefined);
+    // }
   }
 
   async compactInternal(bucket: string | undefined) {
@@ -90,52 +91,97 @@ export class PostgresCompactor {
 
     let currentState: CurrentBucketState | null = null;
 
-    let bucketLower: string | null = null;
+    // GJN: hack to simplify and remove the bucket-specific logic
+    // result: compact will always compact all buckets (which is what we need for our use case anyway)
+    // this lets us remove the lower bound logic from the query
+
     let bucketUpper: string | null = null;
-    const MAX_CHAR = String.fromCodePoint(0xffff);
-
-    if (bucket == null) {
-      bucketLower = '';
-      bucketUpper = MAX_CHAR;
-    } else if (bucket?.includes('[')) {
-      // Exact bucket name
-      bucketLower = bucket;
-      bucketUpper = bucket;
-    } else if (bucket) {
-      // Bucket definition name
-      bucketLower = `${bucket}[`;
-      bucketUpper = `${bucket}[${MAX_CHAR}`;
-    }
-
     let upperOpIdLimit = BIGINT_MAX;
 
+    // GJN: to avoid using collate, just select the max bucket name from the db to use as the initial upper bound
+    // uses an index only scan, so this query is very fast (and only run once)
+    // Limit  (cost=0.55..0.86 rows=1 width=60) (actual time=0.015..0.016 rows=1 loops=1)                                                                 
+    //     -> Index Only Scan Backward using unique_id on bucket_data  (cost = 0.55..85662.92 rows = 275925 width = 60) (actual time = 0.014..0.015 rows = 1 loops = 1)
+    //         Index Cond: (group_id = 25)                                                                                                                
+    //         Heap Fetches: 0                                                                                                                            
+    // Planning Time: 0.075 ms                                                                                                                            
+    // Execution Time: 0.034 ms                                                                                                                           
+    const maxBucketName = await this.db.sql`
+      SELECT bucket_name
+        FROM bucket_data
+        WHERE group_id = ${{ type: 'int4', value: this.group_id }} 
+        ORDER BY bucket_name DESC 
+        LIMIT 1
+    `
+      .decoded(
+        pick(models.BucketData, ['bucket_name'])
+      )
+      .rows();
+    if (maxBucketName.length > 0) {
+      bucketUpper = maxBucketName[0].bucket_name;
+    }
+
     while (true) {
+      // Query changes: 
+      // - remove the lower bound logic from the query as it's not needed for our use case
+      // - remove the collate logic from the query as it's not needed anymore since we selected the actual upper bound already
+
+      // Previous execution plan: (sample query killed after 10 minutes!)
+      // Limit(cost = 0.69..30274.90 rows = 10000 width = 195) |
+      //   -> Index Scan Backward using unique_id on bucket_data  (cost = 0.69..42010218.77 rows = 13876569 width = 195)                                                                                                                               |
+      //     Index Cond: ((group_id = 6) AND(bucket_name >= '':: text))                                                                                                                                                                       |
+      //       Filter: (((bucket_name = 'common_team_data["f03cf665-aa30-48fa-b908-7cb81d36904f"]'::text) AND(op_id < '999999999999':: bigint)) OR(bucket_name < 'common_team_data["f03cf665-aa30-48fa-b908-7cb81d36904f"]':: text COLLATE "C"))|
+
+      // Now using the new execution plan: (execution in about 25ms)
+      // this query seperates the OR logic into two separate queries, eliminating the filter step, which improves the performance significantly
+      // Limit(cost = 12895.41..12895.43 rows = 10 width = 200)(actual time = 22.873..22.877 rows = 10.00 loops = 1) |
+      //   Buffers: shared hit = 10057 |
+      //     -> Sort(cost = 12895.41..12922.84 rows = 10972 width = 200)(actual time = 22.871..22.874 rows = 10.00 loops = 1) |
+      //        Sort Key: bucket_data.bucket_name DESC, bucket_data.op_id DESC |
+      //        Sort Method: top - N heapsort  Memory: 29kB |
+      //        Buffers: shared hit = 10057 |
+      //          -> HashAggregate(cost = 12548.59..12658.31 rows = 10972 width = 200)(actual time = 15.547..17.906 rows = 10000.00 loops = 1) |
+      //            Group Key: bucket_data.op, bucket_data.op_id, bucket_data.source_table, bucket_data.table_name, bucket_data.row_id, bucket_data.source_key, bucket_data.bucket_name |
+      //            Batches: 1  Memory Usage: 2585kB |
+      //            Buffers: shared hit = 10057 |
+      //            -> Append(cost = 0.69..12356.58 rows = 10972 width = 200)(actual time = 0.059..11.068 rows = 10000.00 loops = 1) |
+      //              Buffers: shared hit = 10057 |
+      //              -> Limit(cost = 0.69..1868.81 rows = 972 width = 195)(actual time = 0.029..0.030 rows = 0.00 loops = 1) |
+      //                Buffers: shared hit = 6 |
+      //                -> Index Scan Backward using unique_id on bucket_data  (cost = 0.69..1868.81 rows = 972 width = 195) (actual time = 0.029..0.029 rows = 0.00 loops = 1)                           |
+      //                  Index Cond: ((group_id = 1) AND(bucket_name = 'limited_access_data["bba32733-8015-4033-aa53-520389841f23"]':: text) AND(op_id < 24816835))                      |
+      //                  Index Searches: 1 |
+      //                  Buffers: shared hit = 6 |
+      //              -> Limit(cost = 0.69..10432.91 rows = 10000 width = 195)(actual time = 0.029..10.271 rows = 10000.00 loops = 1) |
+      //                Buffers: shared hit = 10051 |
+      //                -> Index Scan Backward using unique_id on bucket_data bucket_data_1  (cost = 0.69..22453656.07 rows = 21523366 width = 195) (actual time = 0.029..9.495 rows = 10000.00 loops = 1)|
+      //                  Index Cond: ((group_id = 1) AND(bucket_name < 'limited_access_data["bba32733-8015-4033-aa53-520389841f23"]':: text))                                             |
+      //                  Index Searches: 1 |
+      //                  Buffers: shared hit = 10051 |
+      //   Planning Time: 0.210 ms |
+      //   Execution Time: 23.177 ms |
+
       const batch = await this.db.sql`
-        SELECT
-          op,
-          op_id,
-          source_table,
-          table_name,
-          row_id,
-          source_key,
-          bucket_name
-        FROM
-          bucket_data
-        WHERE
-          group_id = ${{ type: 'int4', value: this.group_id }}
-          AND bucket_name >= ${{ type: 'varchar', value: bucketLower }}
-          AND (
-            (
-              bucket_name = ${{ type: 'varchar', value: bucketUpper }}
-              AND op_id < ${{ type: 'int8', value: upperOpIdLimit }}
-            )
-            OR bucket_name < ${{ type: 'varchar', value: bucketUpper }} COLLATE "C" -- Use binary comparison
-          )
-        ORDER BY
-          bucket_name DESC,
-          op_id DESC
-        LIMIT
-          ${{ type: 'int4', value: this.moveBatchQueryLimit }}
+      WITH a as (
+        SELECT op, op_id, source_table, table_name, row_id, source_key, bucket_name
+          FROM bucket_data
+          WHERE group_id = ${{ type: 'int4', value: this.group_id }} 
+            AND bucket_name = ${{ type: 'varchar', value: bucketUpper }}
+            AND op_id < ${{ type: 'int8', value: upperOpIdLimit }}
+          ORDER BY bucket_name DESC, op_id DESC
+          LIMIT ${{ type: 'int4', value: this.moveBatchQueryLimit }}),
+      b as (
+        SELECT op, op_id, source_table, table_name, row_id, source_key, bucket_name 
+          FROM bucket_data
+          WHERE group_id = ${{ type: 'int4', value: this.group_id }} 
+            AND bucket_name < ${{ type: 'varchar', value: bucketUpper }} 
+          ORDER BY bucket_name DESC, op_id DESC 
+          LIMIT ${{ type: 'int4', value: this.moveBatchQueryLimit }})
+      SELECT * FROM a
+      UNION
+      SELECT * FROM b
+        ORDER BY bucket_name DESC, op_id DESC 
+        LIMIT ${{ type: 'int4', value: this.moveBatchQueryLimit }}
       `
         .decoded(
           pick(models.BucketData, ['op', 'source_table', 'table_name', 'source_key', 'row_id', 'op_id', 'bucket_name'])
