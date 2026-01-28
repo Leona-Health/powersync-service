@@ -131,52 +131,57 @@ export class PostgresCompactor {
       //   -> Index Scan Backward using unique_id on bucket_data  (cost = 0.69..42010218.77 rows = 13876569 width = 195)                                                                                                                               |
       //     Index Cond: ((group_id = 6) AND(bucket_name >= '':: text))                                                                                                                                                                       |
       //       Filter: (((bucket_name = 'common_team_data["f03cf665-aa30-48fa-b908-7cb81d36904f"]'::text) AND(op_id < '999999999999':: bigint)) OR(bucket_name < 'common_team_data["f03cf665-aa30-48fa-b908-7cb81d36904f"]':: text COLLATE "C"))|
-      
-      // Now using the new execution plan: (execution in about 15ms)
-      // Limit(cost = 1240120.47..1241287.21 rows = 10000 width = 195)(actual time = 12.555..15.292 rows = 4226 loops = 1) |
-      //   -> Gather Merge(cost = 1240120.47..1267395.77 rows = 233772 width = 195)(actual time = 12.554..15.003 rows = 4226 loops = 1) |
-      //     Workers Planned: 2 |
-      //       Workers Launched: 2 |
-      //         -> Sort(cost = 1239120.44..1239412.66 rows = 116886 width = 195)(actual time = 5.327..5.417 rows = 1409 loops = 3) |
-      //         Sort Key: bucket_name DESC, op_id DESC |
-      //           Sort Method: quicksort  Memory: 915kB |
-      //             Worker 0:  Sort Method: quicksort  Memory: 162kB |
-      //               Worker 1:  Sort Method: quicksort  Memory: 159kB |
-      //                 -> Parallel Bitmap Heap Scan on bucket_data(cost = 83107.46..1230770.27 rows = 116886 width = 195)(actual time = 0.465..1.476 rows = 1409 loops = 3) |
-      //                   Recheck Cond: (((group_id = 6) AND(bucket_name = 'common_team_data["f03cf665-aa30-48fa-b908-7cb81d36904f"]':: text) AND(op_id < '999999999999':: bigint)) OR((group_id = 6) AND(bucket_name < 'common_team_data["f03cf665-aa30-48fa-b908-|
-      //               Heap Blocks: exact = 1687 |
-      //                   -> BitmapOr(cost = 83107.46..83107.46 rows = 280529 width = 0)(actual time = 0.703..0.704 rows = 0 loops = 1) |
-      //                   -> Bitmap Index Scan on unique_id(cost = 0.00..67.33 rows = 211 width = 0)(actual time = 0.015..0.015 rows = 0 loops = 1) |
-      //                   Index Cond: ((group_id = 6) AND(bucket_name = 'common_team_data["f03cf665-aa30-48fa-b908-7cb81d36904f"]':: text) AND(op_id < '999999999999':: bigint)) |
-      //                     -> Bitmap Index Scan on unique_id(cost = 0.00..82899.87 rows = 280318 width = 0)(actual time = 0.687..0.687 rows = 4226 loops = 1) |
-      //                   Index Cond: ((group_id = 6) AND(bucket_name < 'common_team_data["f03cf665-aa30-48fa-b908-7cb81d36904f"]':: text)) |
-      //  Planning Time: 0.119 ms |
-      //  Execution Time: 15.468 ms |
+
+      // Now using the new execution plan: (execution in about 25ms)
+      // this query seperates the OR logic into two separate queries, eliminating the filter step, which improves the performance significantly
+      // Limit(cost = 12895.41..12895.43 rows = 10 width = 200)(actual time = 22.873..22.877 rows = 10.00 loops = 1) |
+      //   Buffers: shared hit = 10057 |
+      //     -> Sort(cost = 12895.41..12922.84 rows = 10972 width = 200)(actual time = 22.871..22.874 rows = 10.00 loops = 1) |
+      //        Sort Key: bucket_data.bucket_name DESC, bucket_data.op_id DESC |
+      //        Sort Method: top - N heapsort  Memory: 29kB |
+      //        Buffers: shared hit = 10057 |
+      //          -> HashAggregate(cost = 12548.59..12658.31 rows = 10972 width = 200)(actual time = 15.547..17.906 rows = 10000.00 loops = 1) |
+      //            Group Key: bucket_data.op, bucket_data.op_id, bucket_data.source_table, bucket_data.table_name, bucket_data.row_id, bucket_data.source_key, bucket_data.bucket_name |
+      //            Batches: 1  Memory Usage: 2585kB |
+      //            Buffers: shared hit = 10057 |
+      //            -> Append(cost = 0.69..12356.58 rows = 10972 width = 200)(actual time = 0.059..11.068 rows = 10000.00 loops = 1) |
+      //              Buffers: shared hit = 10057 |
+      //              -> Limit(cost = 0.69..1868.81 rows = 972 width = 195)(actual time = 0.029..0.030 rows = 0.00 loops = 1) |
+      //                Buffers: shared hit = 6 |
+      //                -> Index Scan Backward using unique_id on bucket_data  (cost = 0.69..1868.81 rows = 972 width = 195) (actual time = 0.029..0.029 rows = 0.00 loops = 1)                           |
+      //                  Index Cond: ((group_id = 1) AND(bucket_name = 'limited_access_data["bba32733-8015-4033-aa53-520389841f23"]':: text) AND(op_id < 24816835))                      |
+      //                  Index Searches: 1 |
+      //                  Buffers: shared hit = 6 |
+      //              -> Limit(cost = 0.69..10432.91 rows = 10000 width = 195)(actual time = 0.029..10.271 rows = 10000.00 loops = 1) |
+      //                Buffers: shared hit = 10051 |
+      //                -> Index Scan Backward using unique_id on bucket_data bucket_data_1  (cost = 0.69..22453656.07 rows = 21523366 width = 195) (actual time = 0.029..9.495 rows = 10000.00 loops = 1)|
+      //                  Index Cond: ((group_id = 1) AND(bucket_name < 'limited_access_data["bba32733-8015-4033-aa53-520389841f23"]':: text))                                             |
+      //                  Index Searches: 1 |
+      //                  Buffers: shared hit = 10051 |
+      //   Planning Time: 0.210 ms |
+      //   Execution Time: 23.177 ms |
+
       const batch = await this.db.sql`
-        SELECT
-          op,
-          op_id,
-          source_table,
-          table_name,
-          row_id,
-          source_key,
-          bucket_name
-        FROM
-          bucket_data
-        WHERE
-          group_id = ${{ type: 'int4', value: this.group_id }}
-          AND (
-            (
-              bucket_name = ${{ type: 'varchar', value: bucketUpper }}
-              AND op_id < ${{ type: 'int8', value: upperOpIdLimit }}
-            )
-            OR bucket_name < ${{ type: 'varchar', value: bucketUpper }}
-          )
-        ORDER BY
-          bucket_name DESC,
-          op_id DESC
-        LIMIT
-          ${{ type: 'int4', value: this.moveBatchQueryLimit }}
+      WITH a as (
+        SELECT op, op_id, source_table, table_name, row_id, source_key, bucket_name
+          FROM bucket_data
+          WHERE group_id = ${{ type: 'int4', value: this.group_id }} 
+            AND bucket_name = ${{ type: 'varchar', value: bucketUpper }}
+            AND op_id < ${{ type: 'int8', value: upperOpIdLimit }}
+          ORDER BY bucket_name DESC, op_id DESC
+          LIMIT ${{ type: 'int4', value: this.moveBatchQueryLimit }}),
+      b as (
+        SELECT op, op_id, source_table, table_name, row_id, source_key, bucket_name 
+          FROM bucket_data
+          WHERE group_id = ${{ type: 'int4', value: this.group_id }} 
+            AND bucket_name < ${{ type: 'varchar', value: bucketUpper }} 
+          ORDER BY bucket_name DESC, op_id DESC 
+          LIMIT ${{ type: 'int4', value: this.moveBatchQueryLimit }})
+      SELECT * FROM a
+      UNION
+      SELECT * FROM b
+        ORDER BY bucket_name DESC, op_id DESC 
+        LIMIT ${{ type: 'int4', value: this.moveBatchQueryLimit }}
       `
         .decoded(
           pick(models.BucketData, ['op', 'source_table', 'table_name', 'source_key', 'row_id', 'op_id', 'bucket_name'])
