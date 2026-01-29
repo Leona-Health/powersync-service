@@ -475,20 +475,111 @@ export class PostgresSyncRulesStorage
      * 1 million rows were only synced before a 5 minute timeout.
      */
     for await (const rows of this.db.streamRows({
+        // statement: `
+        //     SELECT
+        //       *
+        //     FROM
+        //       bucket_data
+        //     WHERE
+        //       group_id = $1
+        //       and op_id <= $2
+        //       and (
+        //       ${filters.map((f, index) => `(bucket_name = $${index * 2 + 4} and op_id > $${index * 2 + 5})`).join(' OR ')}
+        //       )
+        //     ORDER BY
+        //       bucket_name ASC,
+        //       op_id ASC
+        //     LIMIT
+        //       $3;`,
+        //
+        // SF: Replace ORs from original query above to VALUES JOIN in the
+        //     query below to better leverage composite index on the
+        //     bucket_data table.
+        //
+        // This would take minutes to finish with the old query:
+        //
+        // postgres=> SELECT
+        //   *
+        // FROM
+        //   powersync.bucket_data
+        // WHERE
+        //   group_id = 1
+        //   and (
+        //       (bucket_name = 'global_bucket[]' and op_id > 0)
+        //       or (bucket_name = 'user_data["dfec3546-a115-448d-8ffb-a482f7571cdb"]' and op_id > 0)
+        //       or (bucket_name = 'owner_team_data["8aa9d243-18a5-4e8c-99a0-15fcecb713aa"]' and op_id > 0)
+        //       or (bucket_name = 'common_team_data["8aa9d243-18a5-4e8c-99a0-15fcecb713aa"]' and op_id > 0)
+        //       or (bucket_name = 'full_access_team_data["8aa9d243-18a5-4e8c-99a0-15fcecb713aa"]' and op_id > 1252436)
+        //       or (bucket_name = 'profile_data["cd69189a-e144-49cd-956f-eef3b00f4b81"]' and op_id > 0)
+        //   ) and (op_id <= 28247090)
+        // ORDER BY
+        //   bucket_name ASC,
+        //   op_id ASC
+        // LIMIT
+        //   1000;
+        //
+        // With the new query, it takes less than 10 seconds:
+        //
+        // postgres=> explain analyze SELECT b.*
+        // FROM powersync.bucket_data b
+        // JOIN (
+        //   VALUES
+        //     ('global_bucket[]', 0),
+        //     ('user_data["dfec3546-a115-448d-8ffb-a482f7571cdb"]', 0),
+        //     ('owner_team_data["8aa9d243-18a5-4e8c-99a0-15fcecb713aa"]', 0),
+        //     ('common_team_data["8aa9d243-18a5-4e8c-99a0-15fcecb713aa"]', 0),
+        //     ('full_access_team_data["8aa9d243-18a5-4e8c-99a0-15fcecb713aa"]', 1252436),
+        //     ('profile_data["cd69189a-e144-49cd-956f-eef3b00f4b81"]', 0)
+        // ) AS buckets(bucket_name, min_op_id)
+        //   ON b.bucket_name = buckets.bucket_name
+        //  AND b.op_id > buckets.min_op_id
+        // WHERE
+        //   b.group_id = 1
+        //   AND b.op_id <= 28247090
+        // ORDER BY
+        //   b.bucket_name,
+        //   b.op_id
+        // LIMIT 1000;
+        //                                                                         QUERY PLAN
+        // -----------------------------------------------------------------------------------------------------------------------------------------------------------
+        //  Limit  (cost=6195.40..6197.90 rows=1000 width=882) (actual time=5532.821..5532.935 rows=1000.00 loops=1)
+        //    Buffers: shared hit=17754 read=66923
+        //    I/O Timings: shared read=5354.003
+        //    ->  Sort  (cost=6195.40..6202.48 rows=2833 width=882) (actual time=5532.819..5532.863 rows=1000.00 loops=1)
+        //          Sort Key: b.bucket_name, b.op_id
+        //          Sort Method: top-N heapsort  Memory: 1053kB
+        //          Buffers: shared hit=17754 read=66923
+        //          I/O Timings: shared read=5354.003
+        //          ->  Nested Loop  (cost=0.69..6040.07 rows=2833 width=882) (actual time=0.038..5501.596 rows=84811.00 loops=1)
+        //                Buffers: shared hit=17751 read=66923
+        //                I/O Timings: shared read=5354.003
+        //                ->  Values Scan on "*VALUES*"  (cost=0.00..0.08 rows=6 width=36) (actual time=0.001..0.007 rows=6.00 loops=1)
+        //                ->  Index Scan using unique_id on bucket_data b  (cost=0.69..1001.95 rows=472 width=882) (actual time=0.016..914.030 rows=14135.17 loops=6)
+        //                      Index Cond: ((group_id = 1) AND (bucket_name = "*VALUES*".column1) AND (op_id > "*VALUES*".column2) AND (op_id <= 28247090))
+        //                      Index Searches: 6
+        //                      Buffers: shared hit=17751 read=66923
+        //                      I/O Timings: shared read=5354.003
+        //  Planning Time: 0.194 ms
+        //  Execution Time: 5533.187 ms
+        // (19 rows)
+
       statement: `
           SELECT
-            *
+            bd.*
           FROM
-            bucket_data 
+            bucket_data bd
+          JOIN (
+            VALUES
+              ${filters.map((f, index) => `($${index * 2 + 4}, $${index * 2 + 5})`).join(', ')}
+          ) AS buckets(bucket_name, min_op_id)
+            ON bd.bucket_name = buckets.bucket_name
+           AND bd.op_id > buckets.min_op_id
           WHERE
-            group_id = $1
-            and op_id <= $2
-            and (
-            ${filters.map((f, index) => `(bucket_name = $${index * 2 + 4} and op_id > $${index * 2 + 5})`).join(' OR ')}
-            ) 
+            bd.group_id = $1
+            and bd.op_id <= $2
           ORDER BY
-            bucket_name ASC,
-            op_id ASC
+            bd.bucket_name ASC,
+            bd.op_id ASC
           LIMIT
             $3;`,
       params: [
