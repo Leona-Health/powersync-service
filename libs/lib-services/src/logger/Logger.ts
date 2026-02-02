@@ -23,6 +23,7 @@ export const logger = winston.createLogger();
 
 // Configure logging to console as the default
 logger.configure({
+  //level: process.env.NODE_ENV == 'production' ? 'info' : 'debug',
   format: process.env.NODE_ENV == 'production' ? LogFormat.production : LogFormat.development,
   transports: [new winston.transports.Console()]
 });
