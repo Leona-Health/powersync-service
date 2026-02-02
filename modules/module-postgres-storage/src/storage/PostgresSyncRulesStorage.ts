@@ -474,32 +474,44 @@ export class PostgresSyncRulesStorage
      * bucket takes 2 minutes and 11 seconds with the method below. With the JSON method
      * 1 million rows were only synced before a 5 minute timeout.
      */
-    for await (const rows of this.db.streamRows({
-      statement: `
-          SELECT
-            *
-          FROM
-            bucket_data 
-          WHERE
-            group_id = $1
-            and op_id <= $2
-            and (
-            ${filters.map((f, index) => `(bucket_name = $${index * 2 + 4} and op_id > $${index * 2 + 5})`).join(' OR ')}
-            ) 
-          ORDER BY
-            bucket_name ASC,
-            op_id ASC
-          LIMIT
-            $3;`,
-      params: [
+
+    // GJN: rewrite the query to use a CTE with a filter for each bucket
+    // this allows efficient usage of the index on group_id, bucket_name and op_id for each bucket seperately
+    // we were getting mixed results with the original query, this query should be faster and more consistent
+
+    // build a CTE for each bucket
+    function genSubQuery(index: number) {
+      return `filter_${index} AS (
+        SELECT * from bucket_data
+          where group_id = $${index * 5 + 1}
+            and op_id <= $${index * 5 + 2}
+            and op_id > $${index * 5 + 3}
+            and bucket_name = $${index * 5 + 4}
+          ORDER by bucket_name ASC, op_id ASC
+          limit $${index * 5 + 5}
+        )`;
+    }
+    const query = `
+      WITH
+      ${filters.map((_, index) => genSubQuery(index)).join(',\n')}
+      ${filters.map((f, index) => `SELECT * FROM filter_${index}`).join(`\nUNION ALL\n`)}
+      ORDER by bucket_name ASC, op_id ASC
+      LIMIT $${filters.length * 5 + 1};
+      `;
+    const params: StatementParam[] = [
+      ...filters.flatMap((f) => [
         { type: 'int4', value: this.group_id },
         { type: 'int8', value: end },
+        { type: 'int8', value: f.start },
+        { type: 'varchar', value: f.bucket_name },
         { type: 'int4', value: batchRowLimit },
-        ...filters.flatMap((f) => [
-          { type: 'varchar' as const, value: f.bucket_name },
-          { type: 'int8' as const, value: f.start } satisfies StatementParam
-        ])
-      ]
+      ] satisfies StatementParam[]),
+      { type: 'int4', value: batchRowLimit }];
+    framework.logger.debug(`  .. query: ${query}`);
+    framework.logger.debug(`  .. params: ${params.map((p, index) => `$${index + 1}: ${p.value}`).join(', ')}`);
+    for await (const rows of this.db.streamRows({
+      statement: query,
+      params: params
     })) {
       const decodedRows = rows.map((r) => models.BucketData.decode(r as any));
 
@@ -724,16 +736,16 @@ export class PostgresSyncRulesStorage
           doc.bucket,
           doc.has_clear_op == 1
             ? ({
-                // full checksum
-                bucket: doc.bucket,
-                count: Number(doc.total),
-                checksum
-              } satisfies BucketChecksum)
+              // full checksum
+              bucket: doc.bucket,
+              count: Number(doc.total),
+              checksum
+            } satisfies BucketChecksum)
             : ({
-                bucket: doc.bucket,
-                partialCount: Number(doc.total),
-                partialChecksum: checksum
-              } satisfies PartialChecksum)
+              bucket: doc.bucket,
+              partialCount: Number(doc.total),
+              partialChecksum: checksum
+            } satisfies PartialChecksum)
         ];
       })
     );
@@ -877,7 +889,7 @@ class PostgresReplicationCheckpoint implements storage.ReplicationCheckpoint {
     private storage: PostgresSyncRulesStorage,
     public readonly checkpoint: utils.InternalOpId,
     public readonly lsn: string | null
-  ) {}
+  ) { }
 
   getParameterSets(lookups: sync_rules.ParameterLookup[]): Promise<sync_rules.SqliteJsonRow[]> {
     return this.storage.getParameterSets(this, lookups);
