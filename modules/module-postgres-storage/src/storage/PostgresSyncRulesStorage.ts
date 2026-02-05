@@ -376,7 +376,19 @@ export class PostgresSyncRulesStorage
     checkpoint: ReplicationCheckpoint,
     lookups: sync_rules.ParameterLookup[]
   ): Promise<sync_rules.SqliteJsonRow[]> {
+    const serializedLookups = lookups.map((l) => storage.serializeLookupBuffer(l).toString('hex'));
+
     const rows = await this.db.sql`
+      WITH lookups (filter) as (
+        SELECT
+            decode(textfilter::text, 'hex')::bytea -- Decode the hex string to bytea
+          FROM
+            unnest(
+              ARRAY[
+                string_to_array(${{ type: 'varchar', value: serializedLookups.join(',') }}, ',')
+              ]
+            ) as ENCODED(textfilter)
+      )
       SELECT DISTINCT
         ON (lookup, source_table, source_key) lookup,
         source_table,
@@ -384,18 +396,10 @@ export class PostgresSyncRulesStorage
         id,
         bucket_parameters
       FROM
-        bucket_parameters
+        bucket_parameters b
+      INNER JOIN lookups l ON l.filter = b.lookup
       WHERE
         group_id = ${{ type: 'int4', value: this.group_id }}
-        AND lookup = ANY (
-          SELECT
-            decode((FILTER ->> 0)::text, 'hex') -- Decode the hex string to bytea
-          FROM
-            jsonb_array_elements(${{
-        type: 'jsonb',
-        value: lookups.map((l) => storage.serializeLookupBuffer(l).toString('hex'))
-      }}) AS FILTER
-        )
         AND id <= ${{ type: 'int8', value: checkpoint.checkpoint }}
       ORDER BY
         lookup,
