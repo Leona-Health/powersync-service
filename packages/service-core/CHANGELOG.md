@@ -1,5 +1,11 @@
 # @powersync/service-core
 
+## 1.26.0
+
+### Minor Changes
+
+- a997c88: Restructure MongoDB V3 bucket compacting.
+
 ## 1.25.0
 
 ### Minor Changes

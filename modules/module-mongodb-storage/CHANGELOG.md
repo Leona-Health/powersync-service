@@ -1,5 +1,17 @@
 # @powersync/service-module-mongodb-storage
 
+## 0.21.0
+
+### Minor Changes
+
+- a997c88: Restructure MongoDB V3 bucket compacting.
+
+### Patch Changes
+
+- aecf844: Persist subkey instead of re-computing every time.
+- Updated dependencies [a997c88]
+  - @powersync/service-core@1.26.0
+
 ## 0.20.0
 
 ### Minor Changes
